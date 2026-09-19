@@ -70,6 +70,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | GET | `/api/v1/policies/{id}` | 获取策略全文 |
 | DELETE | `/api/v1/policies/{id}` | 删除策略 |
 | POST | `/api/v1/policies/{id}/evaluate` | 提交事实进行裁决 |
+| POST | `/api/v1/policies/{id}/counterfactuals` | 反事实搜索：让裁决唯一变为目标结论的最小修改集 |
 
 ## 策略结构
 
@@ -168,19 +169,93 @@ curl -s -X POST localhost:8000/api/v1/policies/$PID/evaluate \
   "conflicting_conclusions": ["no", "yes"], "decided_priority": 1 }
 ```
 
+## 反事实修改示例（counterfactuals）
+
+在给定事实基础上，按字段提供候选修改值，搜索能让裁决**唯一变为目标结论**
+的所有**包含关系最小**修改集（同一字段一次只能选一个候选值）。
+
+请求体：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `facts` | object | 原始事实（缺省视为 `{}`，缺失/null 字段仍为 unknown） |
+| `target_conclusion` | 非空字符串 | 希望最终唯一得到的结论 |
+| `candidates` | 非空 object | 字段名 → 该字段可选的候选值**非空数组**（每个组合每字段至多取一个值） |
+| `max_changes` | 整数 1–100 | 最多允许修改的字段数 |
+
+非法请求（`candidates` 为空、某字段候选值为空、`max_changes` 非法等）返回
+`422`，响应体含 `errors` 列表。
+
+```bash
+curl -s -X POST localhost:8000/api/v1/policies/$PID/counterfactuals \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "facts": {"income": 40000, "debt_ratio": 0.5},
+    "target_conclusion": "approve",
+    "candidates": {
+      "income": [60000, 30000],
+      "debt_ratio": [0.3, 0.7]
+    },
+    "max_changes": 2
+  }'
+```
+
+响应（节选）：
+
+```json
+{
+  "policy_id": "ab12...",
+  "target_conclusion": "approve",
+  "original_status": "no_match",
+  "original_conclusion": null,
+  "count": 1,
+  "counterfactuals": [
+    {
+      "changes": {"debt_ratio": 0.3, "income": 60000},
+      "verdict": {
+        "status": "decided",
+        "conclusion": "approve",
+        "decided_priority": 10,
+        "true_rule_ids": ["approve"],
+        "level_trace": { "priority": 10, "state": "fired", "...": "..." },
+        "levels_trace": [ "..." ]
+      },
+      "level_trace": { "priority": 10, "state": "fired", "...": "..." }
+    }
+  ]
+}
+```
+
+搜索语义：
+
+- 仅接受最终 `status` 为 `decided` 且结论等于 `target_conclusion` 的修改；
+  修改后仍为 `unknown`、层内 `conflict` 或全部为假 `no_match` 的组合一律排除。
+- **包含关系最小**针对“被修改的字段集合”：若某字段集已能达到目标，其任何超集
+  都被剪枝；同一最小字段集上的不同取值若都能达到目标，则各自独立保留
+  （它们互不包含）。
+- 超过 `max_changes` 个字段的组合不会被枚举。
+- 原始事实已经唯一得到目标结论时，直接返回**一个空修改集**
+  （`"changes": {}`）。
+- 结果稳定排序：先按修改字段数升序，再按字段名（`changes` 的键也按字段名
+  排序输出），最后按候选值的规范 JSON 序（`json.dumps(..., sort_keys=True)`）。
+- 为防止候选空间组合爆炸，求值组合数设有安全上限
+  （`MAX_COUNTERFACTUAL_COMBINATIONS = 100000`）；触顶时返回 `422` 并提示
+  收窄 `candidates` 或减小 `max_changes`，以保证结果始终完整。
+
 ## 项目结构
 
 ```
 app/
-  main.py        # FastAPI 路由、健康检查、请求模型
-  validation.py  # 策略结构校验
-  logic.py       # 三值逻辑、最小决定族、比较可行性
-  engine.py      # 优先级分层、冲突/未知/无匹配裁决、轨迹
-  store.py       # 加锁的内存策略存储
-tests/           # 纯标准库 runner，也可用 pytest
+  main.py            # FastAPI 路由、健康检查、请求模型
+  validation.py      # 策略结构校验、反事实请求校验
+  logic.py           # 三值逻辑、最小决定族、比较可行性
+  engine.py          # 优先级分层、冲突/未知/无匹配裁决、轨迹
+  counterfactual.py  # 反事实最小修改集枚举、剪枝与稳定排序
+  store.py           # 加锁的内存策略存储
+tests/               # 纯标准库 runner，也可用 pytest
 Dockerfile
 docker-compose.yml
-entrypoint.sh    # 启动时安装依赖并运行 uvicorn
+entrypoint.sh        # 启动时安装依赖并运行 uvicorn
 ```
 
 ## 测试
@@ -189,5 +264,6 @@ entrypoint.sh    # 启动时安装依赖并运行 uvicorn
 pip install -r requirements-dev.txt
 python -m pytest tests/ -q
 # 或无需 pytest（tests 内置 runner）：
-python3 tests/test_logic.py && python3 tests/test_engine.py && python3 tests/test_api.py
+python3 tests/test_logic.py && python3 tests/test_engine.py && \
+python3 tests/test_api.py && python3 tests/test_counterfactual.py
 ```

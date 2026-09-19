@@ -8,9 +8,14 @@ from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+from .counterfactual import CounterfactualSearchError, counterfactuals
 from .engine import adjudicate
 from .store import store
-from .validation import PolicyValidationError, validate_policy
+from .validation import (
+    PolicyValidationError,
+    validate_counterfactual_request,
+    validate_policy,
+)
 
 API_PREFIX = "/api/v1"
 
@@ -20,8 +25,9 @@ app = FastAPI(
     description=(
         "Submit policies built from all/any/not and comparison expressions; "
         "evaluate facts with three-valued (true/false/unknown) logic and "
-        "receive priority-based verdicts with per-node derivation traces and "
-        "inclusion-minimal missing-field sets."
+        "receive priority-based verdicts with per-node derivation traces, "
+        "inclusion-minimal missing-field sets, and inclusion-minimal "
+        "counterfactual fact edits that force a target conclusion."
     ),
 )
 
@@ -39,6 +45,19 @@ async def policy_validation_handler(
         content={
             "detail": "Policy structure validation failed",
             "errors": exc.errors,
+        },
+    )
+
+
+@app.exception_handler(CounterfactualSearchError)
+async def counterfactual_search_handler(
+    request: Request, exc: CounterfactualSearchError
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content={
+            "detail": "Counterfactual search failed",
+            "errors": [str(exc)],
         },
     )
 
@@ -124,6 +143,34 @@ async def evaluate_policy(policy_id: str, body: Optional[EvaluateRequest] = None
     verdict = adjudicate(record, facts)
     verdict["policy_id"] = policy_id
     return verdict
+
+
+@app.post(
+    f"{API_PREFIX}/policies/{{policy_id}}/counterfactuals",
+    tags=["adjudication"],
+)
+async def policy_counterfactuals(policy_id: str, request: Request) -> dict:
+    """Find inclusion-minimal fact edits that uniquely force a target verdict."""
+    record = store.get(policy_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Policy not found")
+
+    payload = await _json_body(request)
+    facts, target, candidates, max_changes = validate_counterfactual_request(
+        payload
+    )
+
+    original_verdict, items = counterfactuals(
+        record, facts, target, candidates, max_changes
+    )
+    return {
+        "policy_id": policy_id,
+        "target_conclusion": target,
+        "original_status": original_verdict["status"],
+        "original_conclusion": original_verdict.get("conclusion"),
+        "count": len(items),
+        "counterfactuals": items,
+    }
 
 
 async def _json_body(request: Request) -> Any:

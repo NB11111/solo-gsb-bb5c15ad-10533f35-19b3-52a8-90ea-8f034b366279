@@ -16,6 +16,7 @@ MAX_RULES = 1000
 MAX_PRIORITY = 10**9
 MAX_ID_LENGTH = 200
 MAX_CONCLUSION_LENGTH = 500
+MAX_MAX_CHANGES = 100
 
 
 class PolicyValidationError(ValueError):
@@ -177,3 +178,59 @@ def _json_literal(value: Any) -> bool:
             isinstance(k, str) and _json_literal(v) for k, v in value.items()
         )
     return False
+
+
+def validate_counterfactual_request(payload: Any) -> tuple[dict, str, dict, int]:
+    """Validate a counterfactual request body.
+
+    Returns the normalized ``(facts, target_conclusion, candidates,
+    max_changes)`` tuple; raises :class:`PolicyValidationError` with one error
+    string per detected problem.
+    """
+    errors: list[str] = []
+
+    if not isinstance(payload, dict):
+        raise PolicyValidationError(["request body must be an object"])
+
+    facts = payload.get("facts", {})
+    if not isinstance(facts, dict) or not all(
+        isinstance(k, str) for k in facts
+    ):
+        errors.append("facts: must be an object with string keys")
+
+    target = payload.get("target_conclusion")
+    if not isinstance(target, str) or not target.strip():
+        errors.append("target_conclusion: must be a non-empty string")
+    elif len(target) > MAX_CONCLUSION_LENGTH:
+        errors.append(
+            "target_conclusion: must be at most "
+            f"{MAX_CONCLUSION_LENGTH} characters"
+        )
+
+    candidates = payload.get("candidates")
+    normalized_candidates: dict[str, list] = {}
+    if not isinstance(candidates, dict) or not candidates:
+        errors.append("candidates: must be a non-empty object")
+    else:
+        for field_name, values in candidates.items():
+            prefix = f"candidates.{field_name}"
+            if not isinstance(field_name, str) or not field_name:
+                errors.append(f"{prefix}: candidate field name must be a non-empty string")
+                continue
+            if not isinstance(values, list) or not values:
+                errors.append(f"{prefix}: must be a non-empty array")
+                continue
+            normalized_candidates[field_name] = list(values)
+
+    max_changes = payload.get("max_changes")
+    if isinstance(max_changes, bool) or not isinstance(max_changes, int):
+        errors.append("max_changes: must be a positive integer")
+    elif not 1 <= max_changes <= MAX_MAX_CHANGES:
+        errors.append(
+            f"max_changes: must be between 1 and {MAX_MAX_CHANGES}"
+        )
+
+    if errors:
+        raise PolicyValidationError(errors)
+
+    return facts, target, normalized_candidates, max_changes

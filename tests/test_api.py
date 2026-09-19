@@ -178,6 +178,149 @@ def test_evaluate_unknown_policy_404():
     assert r.status_code == 404
 
 
+# --------------------------------------------------------------------------- #
+# Counterfactuals
+# --------------------------------------------------------------------------- #
+
+def cf(pid, facts, target, candidates, max_changes=5):
+    return client.post(
+        f"/api/v1/policies/{pid}/counterfactuals",
+        json={
+            "facts": facts,
+            "target_conclusion": target,
+            "candidates": candidates,
+            "max_changes": max_changes,
+        },
+    )
+
+
+def test_counterfactual_resolves_unknown_to_target():
+    pid = create_policy()
+    r = cf(pid, {}, "allow",
+           {"age": [10, 18], "country": ["NL", "US"]})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["policy_id"] == pid
+    assert body["target_conclusion"] == "allow"
+    assert body["count"] == 1
+    entry = body["counterfactuals"][0]
+    assert entry["changes"] == {"age": 18, "country": "NL"}
+    assert entry["verdict"]["status"] == "decided"
+    assert entry["verdict"]["conclusion"] == "allow"
+    assert entry["level_trace"]["state"] == "fired"
+
+
+def test_counterfactual_already_target_empty_changes():
+    pid = create_policy()
+    r = cf(pid, {"age": 25, "country": "NL"}, "allow", {"age": [10]})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["count"] == 1
+    assert body["counterfactuals"][0]["changes"] == {}
+    assert body["counterfactuals"][0]["verdict"]["conclusion"] == "allow"
+
+
+def test_counterfactual_stable_sorting():
+    pid = create_policy()
+    # Two independent one-field ways to reach the same target conclusion:
+    # add a new single-rule policy with an OR over two fields.
+    client.put(f"/api/v1/policies/{pid}", json={"rules": [
+        {"id": "r", "priority": 1, "conclusion": "go",
+         "expr": {"any": [
+             {"field": "a", "op": "eq", "value": 1},
+             {"field": "b", "op": "eq", "value": 1},
+         ]}},
+    ]})
+    r = cf(pid, {"a": 0, "b": 0}, "go",
+           {"b": [1, 2], "a": [2, 1]}, max_changes=2)
+    body = r.json()
+    assert [c["changes"] for c in body["counterfactuals"]] == [
+        {"a": 1}, {"b": 1}
+    ]
+    # Two-field supersets are pruned by inclusion minimality.
+    assert all(len(c["changes"]) == 1 for c in body["counterfactuals"])
+
+
+def test_counterfactual_excludes_conflict_and_no_match():
+    pid = create_policy()
+    # v=10 -> conflict (yes and no together); v=5 -> only no; other -> no_match;
+    # v in [7, 10) -> only yes.
+    client.put(f"/api/v1/policies/{pid}", json={"rules": [
+        {"id": "yes", "priority": 1, "conclusion": "yes",
+         "expr": {"field": "v", "op": "ge", "value": 7}},
+        {"id": "no", "priority": 1, "conclusion": "no",
+         "expr": {"any": [
+             {"field": "v", "op": "eq", "value": 5},
+             {"field": "v", "op": "ge", "value": 10},
+         ]}},
+    ]})
+    r = cf(pid, {"v": 0}, "yes", {"v": [10, 7, 5]})
+    body = r.json()
+    assert [c["changes"] for c in body["counterfactuals"]] == [{"v": 7}]
+    assert body["counterfactuals"][0]["verdict"]["conclusion"] == "yes"
+
+
+def test_counterfactual_max_changes():
+    pid = create_policy()
+    client.put(f"/api/v1/policies/{pid}", json={"rules": [
+        {"id": "r", "priority": 1, "conclusion": "go",
+         "expr": {"all": [
+             {"field": "a", "op": "eq", "value": 1},
+             {"field": "b", "op": "eq", "value": 1},
+         ]}},
+    ]})
+    r1 = cf(pid, {}, "go", {"a": [1], "b": [1]}, max_changes=1)
+    assert r1.status_code == 200 and r1.json()["counterfactuals"] == []
+    r2 = cf(pid, {}, "go", {"a": [1], "b": [1]}, max_changes=2)
+    assert r2.json()["counterfactuals"][0]["changes"] == {"a": 1, "b": 1}
+
+
+def test_counterfactual_404():
+    r = client.post("/api/v1/policies/nope/counterfactuals", json={
+        "facts": {}, "target_conclusion": "x",
+        "candidates": {"a": [1]}, "max_changes": 1,
+    })
+    assert r.status_code == 404
+
+
+def test_counterfactual_validation_422():
+    pid = create_policy()
+    base = {
+        "facts": {},
+        "target_conclusion": "allow",
+        "candidates": {"age": [18]},
+        "max_changes": 1,
+    }
+
+    def expect_422(payload):
+        r = client.post(f"/api/v1/policies/{pid}/counterfactuals", json=payload)
+        assert r.status_code == 422, payload
+        body = r.json()
+        assert body["detail"] == "Counterfactual request validation failed"
+        assert isinstance(body["errors"], list) and body["errors"]
+
+    expect_422({**base, "target_conclusion": ""})
+    expect_422({**base, "target_conclusion": None})
+    expect_422({**base, "candidates": {}})
+    expect_422({**base, "candidates": {"age": []}})
+    expect_422({**base, "candidates": {"age": "x"}})
+    expect_422({k: v for k, v in base.items() if k != "candidates"})
+    expect_422({**base, "max_changes": -1})
+    expect_422({**base, "max_changes": "2"})
+    expect_422({**base, "max_changes": True})
+    expect_422({**base, "facts": [1, 2]})
+
+    # Non-object body and malformed JSON.
+    r = client.post(f"/api/v1/policies/{pid}/counterfactuals", json=[1])
+    assert r.status_code == 422
+    r = client.post(
+        f"/api/v1/policies/{pid}/counterfactuals",
+        content="{not json",
+        headers={"Content-Type": "application/json"},
+    )
+    assert r.status_code == 400
+
+
 def _run_all():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failures = 0

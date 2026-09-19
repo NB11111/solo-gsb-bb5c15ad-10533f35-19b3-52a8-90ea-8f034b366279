@@ -8,6 +8,11 @@ from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+from .counterfactual import (
+    CounterfactualValidationError,
+    find_counterfactuals,
+    validate_counterfactual,
+)
 from .engine import adjudicate
 from .store import store
 from .validation import PolicyValidationError, validate_policy
@@ -20,8 +25,8 @@ app = FastAPI(
     description=(
         "Submit policies built from all/any/not and comparison expressions; "
         "evaluate facts with three-valued (true/false/unknown) logic and "
-        "receive priority-based verdicts with per-node derivation traces and "
-        "inclusion-minimal missing-field sets."
+        "receive priority-based verdicts with per-node derivation traces, "
+        "inclusion-minimal missing-field sets and counterfactual fact changes."
     ),
 )
 
@@ -38,6 +43,19 @@ async def policy_validation_handler(
         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
         content={
             "detail": "Policy structure validation failed",
+            "errors": exc.errors,
+        },
+    )
+
+
+@app.exception_handler(CounterfactualValidationError)
+async def counterfactual_validation_handler(
+    request: Request, exc: CounterfactualValidationError
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content={
+            "detail": "Counterfactual request validation failed",
             "errors": exc.errors,
         },
     )
@@ -124,6 +142,22 @@ async def evaluate_policy(policy_id: str, body: Optional[EvaluateRequest] = None
     verdict = adjudicate(record, facts)
     verdict["policy_id"] = policy_id
     return verdict
+
+
+@app.post(
+    f"{API_PREFIX}/policies/{{policy_id}}/counterfactuals",
+    tags=["adjudication"],
+)
+async def policy_counterfactuals(policy_id: str, request: Request) -> dict:
+    """Find inclusion-minimal fact changes that uniquely force a conclusion."""
+    record = store.get(policy_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Policy not found")
+    payload = await _json_body(request)
+    facts, target, candidates, max_changes = validate_counterfactual(payload)
+    result = find_counterfactuals(record, facts, target, candidates, max_changes)
+    result["policy_id"] = policy_id
+    return result
 
 
 async def _json_body(request: Request) -> Any:

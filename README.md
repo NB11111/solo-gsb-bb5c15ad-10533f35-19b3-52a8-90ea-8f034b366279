@@ -70,6 +70,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | GET | `/api/v1/policies/{id}` | 获取策略全文 |
 | DELETE | `/api/v1/policies/{id}` | 删除策略 |
 | POST | `/api/v1/policies/{id}/evaluate` | 提交事实进行裁决 |
+| POST | `/api/v1/policies/{id}/counterfactuals` | 反事实：找出使裁决唯一变为目标结论的最小修改集 |
 
 ## 策略结构
 
@@ -168,19 +169,92 @@ curl -s -X POST localhost:8000/api/v1/policies/$PID/evaluate \
   "conflicting_conclusions": ["no", "yes"], "decided_priority": 1 }
 ```
 
+## 反事实修改（Counterfactuals）
+
+`POST /api/v1/policies/{id}/counterfactuals` 在给定事实基础上，从每个字段
+允许的候选值中挑选（**同字段一次至多取一个候选值**，取或不取均可），找出
+所有**包含关系最小**的修改集，使裁决唯一变为目标结论。
+
+请求体：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `facts` | object，可选（默认 `{}`） | 当前事实；缺失或 `null` 字段按 unknown 处理 |
+| `target_conclusion` | string，必填 | 期望裁决唯一得到的结论 |
+| `candidates` | object，必填且非空 | `字段名 -> 候选值数组`；每字段数组必须非空，值须为 JSON 字面量 |
+| `max_changes` | 非负整数，必填 | 最多修改的字段数，上限 `20`；候选字段数上限 50，候选值总数上限 2000 |
+
+判定与过滤规则：
+
+- 修改后裁决必须为 `decided` 且结论恰好等于 `target_conclusion`；
+  结果仍为 `unknown`、`conflict`、`no_match` 或结论不同的组合一律排除；
+- 修改字段数超过 `max_changes` 的组合不会被尝试；
+- 若某候选值与当前事实严格相等（包括给缺失字段填 `null`），视为“不修改”，
+  自动跳过；策略从未引用的字段也会被忽略；
+- 结果按**修改字段集合**做包含关系最小化（一旦 `S` 已可行，其所有超集被剪除），
+  再按「字段数 → 字段名 → 值的规范 JSON（紧凑、键排序）」稳定排序；
+- 原事实已经得到目标结论时，返回唯一一个**空修改集**。
+
+非法请求（缺字段、`candidates` 为空或含空数组、`max_changes` 非法等）返回
+`422`，响应体格式与策略校验一致：
+
+```json
+{ "detail": "Counterfactual request validation failed",
+  "errors": ["max_changes: must be a non-negative integer"] }
+```
+
+示例（沿用上面的 approve / reject 策略）：
+
+```bash
+curl -s -X POST localhost:8000/api/v1/policies/$PID/counterfactuals \
+  -H 'Content-Type: application/json' \
+  -d '{"facts":{"income":30000},
+       "target_conclusion":"approve",
+       "candidates":{"income":[60000,20000],
+                     "debt_ratio":[0.2,0.5,0.8]},
+       "max_changes":2}'
+```
+
+响应（节选）：
+
+```json
+{
+  "policy_id": "…",
+  "target_conclusion": "approve",
+  "original_status": "unknown",
+  "original_conclusion": null,
+  "max_changes": 2,
+  "count": 1,
+  "counterfactuals": [
+    {
+      "changes": { "debt_ratio": 0.2, "income": 60000 },
+      "verdict": { "status": "decided", "conclusion": "approve",
+                   "decided_priority": 10, "reason": "unique_conclusion",
+                   "true_rule_ids": ["approve"], "…": "…" },
+      "level_trace": { "priority": 10, "state": "fired", "rules": [ "…" ] }
+    }
+  ]
+}
+```
+
+说明：`debt_ratio=0.5` 时该层两条规则都未知（income 也未知/为假）仍是
+unknown，`0.8` 只会触发 `reject`，`income=20000` 与低负债组合仍为
+no_match——这些候选组合均不会出现在结果中。
+
 ## 项目结构
 
 ```
 app/
-  main.py        # FastAPI 路由、健康检查、请求模型
-  validation.py  # 策略结构校验
-  logic.py       # 三值逻辑、最小决定族、比较可行性
-  engine.py      # 优先级分层、冲突/未知/无匹配裁决、轨迹
-  store.py       # 加锁的内存策略存储
-tests/           # 纯标准库 runner，也可用 pytest
+  main.py            # FastAPI 路由、健康检查、请求模型
+  validation.py      # 策略结构校验
+  logic.py           # 三值逻辑、最小决定族、比较可行性
+  engine.py          # 优先级分层、冲突/未知/无匹配裁决、轨迹
+  counterfactual.py  # 反事实最小修改集搜索与请求校验
+  store.py           # 加锁的内存策略存储
+tests/               # 纯标准库 runner，也可用 pytest
 Dockerfile
 docker-compose.yml
-entrypoint.sh    # 启动时安装依赖并运行 uvicorn
+entrypoint.sh        # 启动时安装依赖并运行 uvicorn
 ```
 
 ## 测试
@@ -189,5 +263,6 @@ entrypoint.sh    # 启动时安装依赖并运行 uvicorn
 pip install -r requirements-dev.txt
 python -m pytest tests/ -q
 # 或无需 pytest（tests 内置 runner）：
-python3 tests/test_logic.py && python3 tests/test_engine.py && python3 tests/test_api.py
+python3 tests/test_logic.py && python3 tests/test_engine.py && \
+  python3 tests/test_counterfactual.py && python3 tests/test_api.py
 ```
